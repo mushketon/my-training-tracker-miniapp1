@@ -1,0 +1,166 @@
+import asyncio
+import logging
+import os
+import re
+from datetime import date
+from typing import List, Dict, Any
+
+import aiosqlite
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    print("Ошибка: BOT_TOKEN не найден в .env!")
+    exit(1)
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+DB_PATH = "workouts.db"
+
+# Инициализация базы
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS workouts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                exercise TEXT NOT NULL,
+                sets INTEGER,
+                reps TEXT,
+                weight REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+    print("База данных инициализирована")
+
+# Улучшенный парсер (русский + английский, разные форматы)
+def parse_exercise_line(line: str) -> List[Dict[str, Any]]:
+    line = line.strip().lower()
+    if not line:
+        return []
+
+    # Паттерн: упражнение [sets]x[reps] [weight][кг]
+    pattern = r'^([а-яa-zё\s\-]+?)\s*(?:(\d+)\s*[xх]\s*([\d\-]+|max|до\s*отказа))?\s*([\d,.]+)?\s*(кг|kg|к)?$'
+    match = re.match(pattern, line)
+
+    if match:
+        exercise = match.group(1).strip().title()
+        sets = int(match.group(2)) if match.group(2) else None
+        reps = match.group(3) if match.group(3) else None
+        weight = float(match.group(4).replace(',', '.')) if match.group(4) else None
+        return [{"exercise": exercise, "sets": sets, "reps": reps, "weight": weight}]
+
+    # Простой вариант: просто упражнение + вес
+    simple = r'^([а-яa-zё\s\-]+?)\s*([\d,.]+)?\s*(кг|kg|к)?$'
+    simple_match = re.match(simple, line)
+    if simple_match:
+        exercise = simple_match.group(1).strip().title()
+        weight = float(simple_match.group(2).replace(',', '.')) if simple_match.group(2) else None
+        return [{"exercise": exercise, "weight": weight}]
+
+    return []
+
+# Сохранение тренировки
+async def save_workout(user_id: int, text: str):
+    today = date.today().isoformat()
+    exercises = []
+
+    for line in text.split('\n'):
+        parsed = parse_exercise_line(line)
+        exercises.extend(parsed)
+
+    if not exercises:
+        return False, "Не распознана тренировка 😔\nПример: Жим лежа 3x8 75кг"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for ex in exercises:
+            await db.execute("""
+                INSERT INTO workouts (user_id, date, exercise, sets, reps, weight)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, today, ex["exercise"], ex["sets"], ex["reps"], ex["weight"]))
+        await db.commit()
+
+    return True, f"Сохранено {len(exercises)} упражнений за {today} ✅"
+
+# Статистика
+async def get_stats(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT exercise, SUM(sets * COALESCE(weight, 0)) as volume,
+                   MAX(weight) as max_weight, COUNT(*) as count
+            FROM workouts
+            WHERE user_id = ?
+            GROUP BY exercise
+            ORDER BY volume DESC
+            LIMIT 10
+        """, (user_id,))
+        rows = await cursor.fetchall()
+
+    if not rows:
+        return "Пока нет записей. Добавь тренировку!"
+
+    lines = ["📊 Статистика:"]
+    for ex, vol, maxw, cnt in rows:
+        lines.append(f"• {ex}: объём {vol:.0f} кг • макс {maxw or '?'} кг • {cnt} раз")
+    return "\n".join(lines)
+
+# Последние тренировки
+async def get_progress(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT date, exercise, sets, reps, weight
+            FROM workouts
+            WHERE user_id = ?
+            ORDER BY date DESC, id DESC
+            LIMIT 20
+        """, (user_id,))
+        rows = await cursor.fetchall()
+
+    if not rows:
+        return "Нет записей"
+
+    text = "📈 Последние тренировки:\n"
+    for d, ex, s, r, w in rows:
+        line = f"{d} • {ex}"
+        if s: line += f" {s}x"
+        if r: line += r
+        if w: line += f" {w}кг"
+        text += line + "\n"
+    return text
+
+# Хендлеры
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer("Привет! 💪\nПиши тренировку или используй команды:\n/stats — статистика\n/progress — история")
+
+@dp.message(Command("stats"))
+async def stats(message: Message):
+    text = await get_stats(message.from_user.id)
+    await message.answer(text)
+
+@dp.message(Command("progress"))
+async def progress(message: Message):
+    text = await get_progress(message.from_user.id)
+    await message.answer(text)
+
+@dp.message()
+async def any_message(message: Message):
+    success, resp = await save_workout(message.from_user.id, message.text)
+    await message.answer(resp + ("\n\n/stats для статистики" if success else ""))
+
+async def main():
+    await init_db()
+    print("Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
